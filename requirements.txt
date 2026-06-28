@@ -1,0 +1,30 @@
+# requirements.txt
+# Python 3.10 기준
+# caution: OCR 실행에는 Python 패키지 외에 시스템 Tesseract 실행 파일이 별도로 필요함.
+# Conda 예: conda install -c conda-forge tesseract
+
+# ===== Core numeric / vector search =====
+numpy==1.26.4
+faiss-cpu==1.7.4
+
+# ===== PyTorch / Transformers / Embedding / Reranker =====
+torch==2.3.1
+transformers==4.41.2
+sentence-transformers==2.7.0
+
+# ===== Local GGUF LLM runtime =====
+llama-cpp-python==0.2.90
+
+# ===== PDF parsing / table extraction / OCR =====
+PyMuPDF==1.24.9
+pdfplumber==0.11.4
+pytesseract==0.3.13
+Pillow==10.4.0
+
+# ===== Retrieval / logging / progress =====
+rank-bm25==0.2.2
+rich==13.7.1
+tqdm==4.66.5
+
+# ===== Hugging Face model download =====
+huggingface_hub==0.23.4
