@@ -1,5 +1,7 @@
 # Local PDF RAG QA System
 
+<img src="./sources/rag_pipeline.png">
+
 로컬 PDF 문서를 대상으로 검색 기반 질의응답(RAG)을 수행하는 Python 프로젝트입니다.  
 PDF 텍스트, 표, OCR 결과를 함께 인덱싱하고, 검색된 근거를 바탕으로 로컬 LLM이 최종 답변을 생성합니다.
 
