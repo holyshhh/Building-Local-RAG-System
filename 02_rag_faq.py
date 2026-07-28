@@ -1,5 +1,6 @@
 import argparse
 import gc
+import time
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import tempfile
 import textwrap
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -66,7 +68,6 @@ PROBLEM_SET = [
         "question": "발급받은 개인통관고유부호가 기억나지 않을 때 조회 가능한 이용 경로를 모두 나열하세요.",
     },
 ]
-
 
 @dataclass
 class Chunk:
@@ -241,21 +242,44 @@ def normalize_heading_title(text: str) -> str:
 
 
 def extract_toc_heading_map(block_chunks: List[Chunk]) -> Dict[str, str]:
-    """목차 페이지에서 FAQ 번호와 제목을 추출해 매핑"""
+    """목차에서 FAQ 번호와 제목을 추출"""
     toc_map: Dict[str, str] = {}
-
+    lines: List[str] = []
     for c in block_chunks:
+        if c.page > 2:
+            continue
         for line in str(c.text).splitlines():
             t = normalize_space(line)
-            m = TOC_HEADING_RE.match(t)
-            if not m:
-                continue
+            if t:
+                lines.append(t)
 
-            q_no = m.group(1)
+    pending: Optional[str] = None
+    for t in lines:
+        if re.match(r"^Q\s*\d{1,2}\.", t, flags=re.IGNORECASE):
+            if pending:
+                m0 = re.match(r"^Q\s*(\d{1,2})\.\s*(.+)$", pending, flags=re.IGNORECASE)
+                if m0:
+                    title0 = normalize_heading_title(m0.group(2))
+                    if len(title0) >= 4:
+                        toc_map[m0.group(1)] = title0
+            pending = t
+        elif pending:
+            pending = normalize_space(pending + " " + t)
+
+        if pending:
+            m = TOC_HEADING_RE.match(pending)
+            if m:
+                title = normalize_heading_title(m.group(2))
+                if len(title) >= 4:
+                    toc_map[m.group(1)] = title
+                pending = None
+
+    if pending:
+        m = re.match(r"^Q\s*(\d{1,2})\.\s*(.+)$", pending, flags=re.IGNORECASE)
+        if m:
             title = normalize_heading_title(m.group(2))
             if len(title) >= 4:
-                toc_map[q_no] = title
-
+                toc_map[m.group(1)] = title
     return toc_map
 
 
@@ -275,17 +299,20 @@ def is_section_heading_text(text: str, toc_heading_map: Optional[Dict[str, str]]
 
     if toc_heading_map:
         toc_title = toc_heading_map.get(section_no)
-        if not toc_title:
-            return False
-        if title_norm == toc_title:
-            return True
-        if title_norm and toc_title and (title_norm in toc_title or toc_title in title_norm):
-            return True
+        if toc_title:
+            if title_norm == toc_title:
+                return True
+            if title_norm and (title_norm in toc_title or toc_title in title_norm):
+                return True
+            common = set(title_norm) & set(toc_title)
+            denom = max(len(set(title_norm) | set(toc_title)), 1)
+            return len(common) / denom >= 0.72
 
-
-        common = set(title_norm) & set(toc_title)
-        denom = max(len(set(title_norm) | set(toc_title)), 1)
-        return len(common) / denom >= 0.72
+        # 목차 파싱 실패가 section 경계 전체를 무너뜨리지 않도록 독립적인 질문형 제목도 허용
+        # 번호, 짧은 제목, 질문형 어미를 모두 포함해 본문의 번호 목록을 제목으로 오인하는 위험 축소
+        if len(title_norm) >= 6 and re.search(r"(나요|까요|어요|아요|싶어요|해주세요|알려주세요|안돼요)$", t):
+            return True
+        return False
 
 
     if "다음과같습니다" in normalize_heading_title(t):
@@ -581,6 +608,7 @@ def e5_query(text: str) -> str:
     return "query: " + text
 
 
+@lru_cache(maxsize=1)
 def get_embedder():
     import torch
 
@@ -588,6 +616,7 @@ def get_embedder():
     return SentenceTransformer(str(EMBED_MODEL_PATH), device=device)
 
 
+@lru_cache(maxsize=1)
 def get_reranker():
     import torch
 
@@ -677,6 +706,19 @@ def reciprocal_rank_fusion(ranked_lists: List[List[int]], k: int = 60) -> Dict[i
     return scores
 
 
+_BM25_CACHE_KEY = None
+_BM25_CACHE = None
+
+def get_bm25_index(chunks: List[Chunk]):
+    """같은 chunk 집합에 대해 BM25 corpus를 한 번만 구성"""
+    global _BM25_CACHE_KEY, _BM25_CACHE
+    key = (len(chunks), chunks[0].chunk_id if chunks else None, chunks[-1].chunk_id if chunks else None)
+    if _BM25_CACHE is None or _BM25_CACHE_KEY != key:
+        tokenized_corpus = [tokenize(c.text) for c in chunks]
+        _BM25_CACHE = BM25Okapi(tokenized_corpus)
+        _BM25_CACHE_KEY = key
+    return _BM25_CACHE
+
 def first_stage_retrieve(
     question: str,
     chunks: List[Chunk],
@@ -704,8 +746,7 @@ def first_stage_retrieve(
         if int(idx) >= 0
     }
 
-    tokenized_corpus = [tokenize(c.text) for c in chunks]
-    bm25 = BM25Okapi(tokenized_corpus)
+    bm25 = get_bm25_index(chunks)
     bm25_scores = bm25.get_scores(tokenize(question))
 
     bm25_ranked = np.argsort(-bm25_scores)[: min(bm25_k, len(chunks))].tolist()
@@ -743,7 +784,7 @@ def rerank(
 
     reranker = get_reranker()
     pairs = [(question, c["chunk"].text) for c in candidates]
-    scores = reranker.predict(pairs)
+    scores = reranker.predict(pairs, batch_size=32, show_progress_bar=False)
 
     rescored = []
     for item, score in zip(candidates, scores):
@@ -1010,6 +1051,23 @@ for line in sys.stdin:
     try:
         req = json.loads(line)
         req_id = req.get("request_id")
+        op = req.get("op", "chat")
+        if op == "count_chat_tokens":
+            messages = req["messages"]
+            # llama.cpp가 실제 completion에 적용하는 chat template까지 포함해 계산한다.
+            try:
+                rendered = llm.apply_chat_template(messages, add_generation_prompt=True)
+                if isinstance(rendered, str):
+                    token_count = len(llm.tokenize(rendered.encode("utf-8"), add_bos=False, special=True))
+                else:
+                    token_count = len(rendered)
+            except Exception:
+                # 구버전 llama-cpp-python 호환 경로
+                joined = "\n".join(str(m.get("role", "")) + ": " + str(m.get("content", "")) for m in messages)
+                token_count = len(llm.tokenize(joined.encode("utf-8"), add_bos=True, special=True)) + 16
+            print(json.dumps({"ok": True, "request_id": req_id, "response": {"token_count": token_count}}, ensure_ascii=False), flush=True)
+            continue
+
         call_kwargs = {
             "messages": req["messages"],
             "temperature": float(req.get("temperature", 0.0)),
@@ -1105,6 +1163,7 @@ for line in sys.stdin:
         self._request_id += 1
         req = {
             "request_id": self._request_id,
+            "op": "chat",
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
@@ -1121,6 +1180,26 @@ for line in sys.stdin:
                     break
                 self._start_worker()
         raise RuntimeError(f"LLM worker failed after restart attempts: {last_error}")
+
+    def count_chat_tokens(self, messages: List[Dict[str, str]]) -> int:
+        """worker 내부의 실제 GGUF tokenizer와 chat template으로 prompt token 수를 계산한다."""
+        self._request_id += 1
+        req = {
+            "request_id": self._request_id,
+            "op": "count_chat_tokens",
+            "messages": messages,
+        }
+        last_error = None
+        for attempt in range(self.max_restarts + 1):
+            try:
+                resp = self._send_once(req)
+                return int(resp["token_count"])
+            except Exception as e:
+                last_error = e
+                if attempt >= self.max_restarts:
+                    break
+                self._start_worker()
+        raise RuntimeError(f"LLM token counting failed after restart attempts: {last_error}")
 
     def kill(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -1159,7 +1238,7 @@ for line in sys.stdin:
         self.close()
 
 def estimate_token_count(text: str) -> int:
-    """GGUF tokenizer를 매번 띄우지 않기 위한 보수적 토큰 수 추정."""
+    """GGUF tokenizer를 매번 띄우지 않기 위한 보수적 토큰 수 추정"""
     text = str(text)
     ascii_chars = sum(1 for ch in text if ord(ch) < 128)
     non_ascii_chars = len(text) - ascii_chars
@@ -1313,7 +1392,7 @@ def split_answer_units_from_text(text: str, max_unit_chars: int = 1500) -> List[
 
 
 def infer_question_intent(question: str) -> str:
-    """질문의 답변 형태를 고르기 위한 간단한 의도 분류를 수행"""
+    """질문의 답변 형태를 고르기 위한 간단한 의도 분류 수행"""
     q = normalize_space(question)
     if re.search(r"나열|열거|종류|목록|항목|예시|\d+\s*가지|두\s*가지|세\s*가지|이상", q):
         return "list"
@@ -1526,7 +1605,7 @@ def rerank_answer_units(
         try:
             reranker = get_reranker()
             pairs = [(question, u.text) for u in prelim]
-            scores = reranker.predict(pairs)
+            scores = reranker.predict(pairs, batch_size=32, show_progress_bar=False)
             for u, s in zip(prelim, scores):
                 u.cross_score = float(s)
 
@@ -2562,6 +2641,48 @@ def normalize_question_plan(raw: Dict[str, Any], question: str, max_queries: int
     }
 
 
+def plan_question_heuristically(question: str, max_queries: int = 3, max_requirements: int = 6) -> Dict[str, Any]:
+    """
+    LLM 호출 없이 복합 질문의 요구사항과 검색 질의를 구성
+    원 질문을 항상 유지하고 연결어, 구두점 기준으로 분리한 절을 focused query로 사용
+    """
+    q = normalize_space(question)
+    stripped = re.sub(r"(?:알려\s*주세요|답(?:하|해)세요|나열(?:하|해)세요|설명(?:하|해)세요)[?.!]*$", "", q).strip()
+    parts = re.split(r"\s*(?:그리고|또한|및|와|과|,|;|/|\?|\.)\s*", stripped)
+    parts = [normalize_space(p) for p in parts if len(normalize_space(p)) >= 4]
+
+    requirements = []
+    seen = set()
+    for p in parts:
+        key = normalize_for_tokenize(p)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        requirements.append({"id": f"R{len(requirements)+1}", "requirement": p, "type": infer_question_intent(p)})
+        if len(requirements) >= max_requirements:
+            break
+
+    queries = [q]
+    for req in requirements:
+        rq = req["requirement"]
+        if normalize_for_tokenize(rq) != normalize_for_tokenize(q) and rq not in queries:
+            queries.append(rq)
+        if len(queries) >= max_queries:
+            break
+
+    intent = infer_question_intent(q)
+    comprehensive = bool(re.search(r"모두|전부|각각|나열|전체|가능한|방법들|경로들", q)) or len(requirements) > 1
+    return {
+        "enabled": True,
+        "planner": "heuristic",
+        "question": q,
+        "answer_style": intent,
+        "requires_comprehensive_coverage": comprehensive,
+        "requirements": requirements,
+        "retrieval_queries": queries[:max_queries],
+        "raw": {"source": "heuristic"},
+    }
+
 def plan_question_with_llm(llm, question: str, max_queries: int = 3, max_requirements: int = 6) -> Dict[str, Any]:
     question = normalize_space(question)
     if max_queries <= 1:
@@ -2660,10 +2781,9 @@ def extract_query_focused_text_for_composer(
     question_plan: Optional[Dict[str, Any]] = None,
     max_chars: int = 1800,
 ) -> str:
-    """composer에 넘길 evidence를 질문 중심으로 압축
-
-    단일 top span만 남기지 않고, 복수 조건/나열형 질문에서는 같은 section 안의
-    구조적 하위 항목과 인접 줄을 함께 보존
+    """
+    composer에 넘길 evidence를 질문 중심으로 압축
+    단일 top span만 남기지 않고, 복수 조건/나열형 질문에서는 같은 section 내부 구조적 하위 항목과 인접 줄을 함께 보존
     """
     text = clean_text(text)
     if not text:
@@ -2809,56 +2929,163 @@ Rules:
     return queries, {"enabled": True, "raw": obj, "queries": queries}
 
 
+
+NEGATION_PATTERNS = (
+    r"없(?:는|을|어|습니다|나요|다면)?", r"아니", r"안\s*되", r"못\s*하", r"불가", r"제한"
+)
+POSITIVE_ONLY_PATTERNS = (
+    r"있는\s*경우", r"가능합니다", r"가능하며", r"할\s*수\s*있"
+)
+
+
+def contains_negation(text: str) -> bool:
+    t = normalize_space(text)
+    return any(re.search(p, t) for p in NEGATION_PATTERNS)
+
+
+def anchor_relevance_score(question: str, chunk: Chunk) -> float:
+    """
+    FAQ 제목/anchor와 사용자 질문의 일치도를 별도로 계산
+    본문이 길수록 공통 단어가 많은 다른 FAQ가 Cross-Encoder 상위로 올라올 수 있으므로,
+    질문형 문서에서는 제목 일치도를 rerank pool 보존과 최종 정렬에 사용
+    """
+    anchor = normalize_space(chunk.anchor_text or "")
+    if not anchor and chunk.role == "anchor_question":
+        anchor = normalize_space(chunk.text)
+    if not anchor and chunk.kind == "section":
+        anchor = normalize_space(str(chunk.text).splitlines()[0] if chunk.text else "")
+    if not anchor:
+        return 0.0
+    lexical = query_overlap_score(question, anchor)
+    qn = set(tokenize(question, min_len=2))
+    an = set(tokenize(anchor, min_len=2))
+    jaccard = len(qn & an) / max(len(qn | an), 1)
+    return 0.55 * lexical + 0.45 * jaccard
+
+
+def polarity_adjustment(question: str, text: str) -> float:
+    """부정 조건 질문에 정반대의 긍정 조건 문장이 선택되는 것을 완화"""
+    q_neg = contains_negation(question)
+    t_neg = contains_negation(text)
+    if q_neg and not t_neg and any(re.search(p, text) for p in POSITIVE_ONLY_PATTERNS):
+        return -0.35
+    if q_neg and t_neg:
+        return 0.12
+    return 0.0
+
+
+def build_rerank_pool(question: str, merged_candidates: List[Dict[str, Any]], pool_k: int) -> List[Dict[str, Any]]:
+    """RRF 상위 후보와 FAQ anchor 일치 후보를 함께 보존"""
+    if not merged_candidates:
+        return []
+    pool_k = max(1, int(pool_k))
+    regular_k = max(1, pool_k - min(8, max(2, pool_k // 5)))
+    chosen = list(merged_candidates[:regular_k])
+    seen = {x["chunk"].chunk_id for x in chosen}
+    anchor_ranked = sorted(
+        merged_candidates,
+        key=lambda x: (
+            anchor_relevance_score(question, x["chunk"]),
+            float(x.get("merge_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    for item in anchor_ranked:
+        if len(chosen) >= pool_k:
+            break
+        cid = item["chunk"].chunk_id
+        if cid in seen:
+            continue
+        if anchor_relevance_score(question, item["chunk"]) <= 0:
+            continue
+        chosen.append(item)
+        seen.add(cid)
+    if len(chosen) < pool_k:
+        for item in merged_candidates:
+            if len(chosen) >= pool_k:
+                break
+            if item["chunk"].chunk_id not in seen:
+                chosen.append(item)
+                seen.add(item["chunk"].chunk_id)
+    return chosen
+
+
+def rerank_with_structure(question: str, candidates: List[Dict[str, Any]], top_k: int, enabled: bool) -> List[Dict[str, Any]]:
+    hits = rerank(question=question, candidates=candidates, top_k=len(candidates), enabled=enabled)
+    rescored = []
+    for item in hits:
+        copied = dict(item)
+        base = float(copied.get("rerank_score") or 0.0) if enabled else float(copied.get("merge_score") or copied.get("rrf_score") or 0.0)
+        anchor = anchor_relevance_score(question, copied["chunk"])
+        polarity = polarity_adjustment(question, clean_text(copied["chunk"].answer_text or copied["chunk"].text))
+        copied["anchor_relevance_score"] = anchor
+        copied["polarity_adjustment"] = polarity
+        copied["structured_rerank_score"] = base + 0.55 * anchor + polarity
+        rescored.append(copied)
+    rescored.sort(key=lambda x: x["structured_rerank_score"], reverse=True)
+    for rank, item in enumerate(rescored[:top_k], start=1):
+        item["rank"] = rank
+    return rescored[:top_k]
+
 def retrieve_context_items_for_queries(question: str, retrieval_queries: List[str], chunks: List[Chunk], index, args) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    다중 질의의 1차 검색 결과를 먼저 합친 뒤 Cross-Encoder를 한 번만 실행
+    각 질의의 Dense/BM25/RRF coverage를 보존하면서 후보를 통합하고, 원 질문 기준으로 한 번만 재랭킹
+    """
     merged: Dict[str, Dict[str, Any]] = {}
     per_query: List[Dict[str, Any]] = []
 
     for q_idx, retrieval_query in enumerate(retrieval_queries, start=1):
         candidates = first_stage_retrieve(
-            question=retrieval_query,
-            chunks=chunks,
-            index=index,
-            dense_k=args.dense_k,
-            bm25_k=args.bm25_k,
-            rrf_k=args.rrf_k,
+            question=retrieval_query, chunks=chunks, index=index,
+            dense_k=args.dense_k, bm25_k=args.bm25_k, rrf_k=args.rrf_k,
             candidate_k=args.candidate_k,
         )
-        hits = rerank(
-            question=retrieval_query,
-            candidates=candidates,
-            top_k=args.top_k,
-            enabled=not args.no_reranker,
-        )
-        expanded = expand_neighbors(
-            hits=hits,
-            chunks=chunks,
-            window=args.expand_window,
-            max_context_chunks=args.max_context_chunks,
-        )
-        per_query.append({"query_index": q_idx, "query": retrieval_query, "context_count": len(expanded)})
-        for item in expanded:
+        per_query.append({"query_index": q_idx, "query": retrieval_query, "candidate_count": len(candidates)})
+        for item in candidates:
             c = item["chunk"]
             key = c.chunk_id
-            score = float(item.get("rerank_score") or 0.0) + 5.0 * float(item.get("rrf_score") or 0.0)
-            copied = dict(item)
-            copied["retrieval_query"] = retrieval_query
-            copied["retrieval_query_index"] = q_idx
-            copied["merge_score"] = score
-            if key not in merged or score > float(merged[key].get("merge_score") or 0.0):
+            if key not in merged:
+                copied = dict(item)
+                copied["retrieval_queries"] = [retrieval_query]
+                copied["query_support_count"] = 1
+                copied["aggregate_rrf_score"] = float(item.get("rrf_score") or 0.0)
                 merged[key] = copied
+            else:
+                cur = merged[key]
+                if retrieval_query not in cur["retrieval_queries"]:
+                    cur["retrieval_queries"].append(retrieval_query)
+                    cur["query_support_count"] += 1
+                cur["aggregate_rrf_score"] += float(item.get("rrf_score") or 0.0)
+                cur["dense_score"] = max(float(cur.get("dense_score") or 0.0), float(item.get("dense_score") or 0.0))
+                cur["bm25_score"] = max(float(cur.get("bm25_score") or 0.0), float(item.get("bm25_score") or 0.0))
 
-    context_items = list(merged.values())
+    merged_candidates = list(merged.values())
+    for item in merged_candidates:
+        item["rrf_score"] = float(item.get("aggregate_rrf_score") or 0.0)
+        item["retrieval_query"] = " | ".join(item.get("retrieval_queries", []))
+        item["merge_score"] = item["rrf_score"] + 0.01 * int(item.get("query_support_count", 1))
+    merged_candidates.sort(key=lambda x: x.get("merge_score", 0.0), reverse=True)
 
-    def sort_key(item: Dict[str, Any]) -> Tuple[int, int, float, int]:
-        c = item["chunk"]
-        kind_order = {"section": 0, "text": 1, "table": 2, "ocr": 3}.get(c.kind, 9)
-        return (int(item.get("retrieval_query_index", 9999)), kind_order, -float(item.get("merge_score") or 0.0), c.page)
+    rerank_pool_k = int(getattr(args, "rerank_pool_k", max(args.candidate_k, args.top_k * 2)))
+    rerank_pool = build_rerank_pool(question, merged_candidates, rerank_pool_k)
+    hits = rerank_with_structure(
+        question=question, candidates=rerank_pool, top_k=args.top_k, enabled=not args.no_reranker
+    )
+    expanded = expand_neighbors(hits=hits, chunks=chunks, window=args.expand_window, max_context_chunks=args.max_context_chunks)
 
-    context_items.sort(key=sort_key)
-    return context_items[: args.max_context_chunks], {"queries": retrieval_queries, "per_query": per_query}
-
+    diagnostics = {
+        "queries": retrieval_queries,
+        "per_query": per_query,
+        "unique_candidate_count": len(merged_candidates),
+        "rerank_pool_count": len(rerank_pool),
+        "reranker_calls": 1 if (not args.no_reranker and rerank_pool) else 0,
+        "final_context_count": len(expanded),
+    }
+    return expanded, diagnostics
 
 def composer_item_from_unit(unit: AnswerUnit, source: str) -> Dict[str, Any]:
+    """AnswerUnit을 grounded composer가 사용하는 공통 evidence 형식으로 변환"""
     return {
         "source": source,
         "text": clean_unit_for_final(unit.text),
@@ -2869,10 +3096,13 @@ def composer_item_from_unit(unit: AnswerUnit, source: str) -> Dict[str, Any]:
         "source_role": unit.source_role,
         "source_chunk_id": unit.source_chunk_id,
         "context_type": unit.context_type,
+        "unit_score": float(getattr(unit, "score", 0.0) or 0.0),
+        "cross_score": float(getattr(unit, "cross_score", 0.0) or 0.0),
     }
 
 
 def composer_item_from_context(item: Dict[str, Any], source: str) -> Dict[str, Any]:
+    """검색 context item을 grounded composer가 사용하는 공통 evidence 형식으로 변환"""
     c = item["chunk"]
     return {
         "source": source,
@@ -2884,6 +3114,9 @@ def composer_item_from_context(item: Dict[str, Any], source: str) -> Dict[str, A
         "source_role": c.role,
         "source_chunk_id": c.chunk_id,
         "context_type": str(item.get("context_type", "retrieved")),
+        "rerank_score": float(item.get("rerank_score") or 0.0),
+        "anchor_relevance_score": float(item.get("anchor_relevance_score") or anchor_relevance_score("", c)),
+        "anchor_text": str(c.anchor_text or ""),
     }
 
 
@@ -2933,11 +3166,19 @@ def build_composer_evidence(
     section_items.sort(key=context_relevance, reverse=True)
 
     if comprehensive:
+        # 포괄 질문이라고 관련 section을 여러 개 무조건 넣으면 다른 FAQ가 composer를 오염시킴
+        # 질문과 FAQ anchor가 가장 가까운 section을 우선하고, 최고점과 충분히 가까운 section만 제한적으로 보존
         section_count = 0
+        top_anchor = max((anchor_relevance_score(question, x["chunk"]) for x in section_items), default=0.0)
         for item in section_items:
-            if len(items) >= max_items or section_count >= max_sections:
+            if len(items) >= max_items or section_count >= min(max_sections, 2):
                 break
-            add(composer_item_from_context(item, "coverage_parent_section_context"), source_priority=0)
+            a_score = anchor_relevance_score(question, item["chunk"])
+            if section_count > 0 and top_anchor > 0 and a_score < top_anchor * 0.72:
+                continue
+            ev = composer_item_from_context(item, "coverage_parent_section_context")
+            ev["anchor_relevance_score"] = a_score
+            add(ev, source_priority=0)
             section_count += 1
 
     for ev in answer_obj.get("evidence", []) or []:
@@ -2981,6 +3222,104 @@ def build_composer_evidence(
     return items[:max_items]
 
 
+
+def build_requirement_evidence_map(
+    question: str,
+    question_plan: Optional[Dict[str, Any]],
+    evidence_items: List[Dict[str, Any]],
+    top_per_requirement: int = 3,
+    max_total: int = 10,
+) -> Tuple[List[Dict[str, Any]], Dict[str, List[str]]]:
+    """
+    각 질문 요구사항에 직접 대응하는 evidence를 우선 선택
+    요구사항별 점수로 대표 근거를 뽑아 coverage를 확보하고, 같은 section의 중복 chunk 발생을 제한
+    """
+    if not evidence_items:
+        return [], {}
+    reqs = []
+    for idx, req in enumerate((question_plan or {}).get("requirements", []) or [], start=1):
+        if isinstance(req, dict):
+            rid = str(req.get("id") or f"R{idx}")
+            text = normalize_space(req.get("requirement", ""))
+        else:
+            rid, text = f"R{idx}", normalize_space(req)
+        if text:
+            reqs.append((rid, text))
+    if not reqs:
+        reqs = [("R1", normalize_space(question))]
+
+    selected_ids = set()
+    mapping: Dict[str, List[str]] = {}
+    per_section_count: Dict[str, int] = {}
+
+    def score(req_text: str, ev: Dict[str, Any]) -> float:
+        text = normalize_space(ev.get("text", ""))
+        anchor = normalize_space(ev.get("anchor_text", ""))
+        val = 1.15 * query_overlap_score(req_text, text)
+        val += 0.45 * query_overlap_score(question, text)
+        if anchor:
+            val += 0.9 * query_overlap_score(req_text, anchor)
+            val += 0.35 * query_overlap_score(question, anchor)
+        val += 0.18 * float(ev.get("cross_score") or ev.get("rerank_score") or 0.0)
+        val += 0.08 * float(ev.get("unit_score") or 0.0)
+        val -= 0.06 * int(ev.get("source_priority", 5))
+        val += polarity_adjustment(question, text)
+        if ev.get("source_kind") == "ocr":
+            val -= 0.25
+        return val
+
+    for rid, req_text in reqs:
+        ranked = sorted(evidence_items, key=lambda ev: score(req_text, ev), reverse=True)
+        picked = []
+        for ev in ranked:
+            eid = ev.get("evidence_id")
+            if not eid:
+                continue
+            section_key = str(ev.get("source_chunk_id") or "")
+            # 동일 parent/section의 거의 같은 근거가 한 requirement를 독점하지 않게 제한
+            if section_key and per_section_count.get(section_key, 0) >= 2 and eid not in selected_ids:
+                continue
+            picked.append(eid)
+            selected_ids.add(eid)
+            if section_key:
+                per_section_count[section_key] = per_section_count.get(section_key, 0) + 1
+            if len(picked) >= top_per_requirement:
+                break
+        mapping[rid] = picked
+
+    # 질문 anchor와 가장 가까운 parent section은 포괄 질문에서
+    # 전체 대안/경로를 담고 있을 가능성이 높으므로 반드시 보존
+    if is_comprehensive_plan(question_plan):
+        sections = [ev for ev in evidence_items if ev.get("source_kind") == "section"]
+        if sections:
+            best = max(
+                sections,
+                key=lambda ev: query_overlap_score(question, ev.get("anchor_text", ""))
+                + 0.5 * query_overlap_score(question, ev.get("text", "")),
+            )
+            selected_ids.add(best["evidence_id"])
+            mapping.setdefault("R1", [])
+            if best["evidence_id"] not in mapping["R1"]:
+                mapping["R1"].insert(0, best["evidence_id"])
+
+    selected = []
+    for ev in evidence_items:
+        if ev.get("evidence_id") not in selected_ids:
+            continue
+        ev2 = dict(ev)
+        ev2["supports_requirements"] = [rid for rid, ids in mapping.items() if ev2["evidence_id"] in ids]
+        selected.append(ev2)
+    selected.sort(key=lambda ev: (
+        min([int(r[1:]) for r in ev.get("supports_requirements", []) if r[1:].isdigit()] or [999]),
+        int(ev.get("source_priority", 5)),
+        -float(ev.get("anchor_relevance_score") or 0.0),
+    ))
+    selected = selected[:max_total]
+    selected_set = {ev["evidence_id"] for ev in selected}
+    mapping = {rid: [eid for eid in ids if eid in selected_set] for rid, ids in mapping.items()}
+    return selected, mapping
+
+
 def format_composer_evidence(evidence_items: List[Dict[str, Any]]) -> str:
     blocks = []
     for ev in evidence_items:
@@ -2990,6 +3329,7 @@ def format_composer_evidence(evidence_items: List[Dict[str, Any]]) -> str:
         page: {ev.get('page', '')}
         locator: {ev.get('locator', '')}
         source_kind: {ev.get('source_kind', '')}
+        supports_requirements: {', '.join(ev.get('supports_requirements', [])) or 'general'}
         text:
         {ev.get('text', '')}
         """).strip())
@@ -3062,7 +3402,10 @@ def call_grounded_composer(
         )
         return safe_json_loads(resp["choices"][0]["message"]["content"])
     except Exception as json_error:
-        plain_system = system_prompt.replace("Return only JSON.", "Return a concise Korean answer with evidence IDs.")
+        error_text = str(json_error)
+        if "exceed context window" in error_text.lower() or "requested tokens" in error_text.lower():
+            raise
+        plain_system = system_prompt + "\nJSON 생성에 실패했습니다. 아래 지정 형식만 출력하십시오."
         plain_user = f"""
 [Question]
 {question}
@@ -3155,32 +3498,35 @@ def build_grounded_answer_prompt(
     question_plan: Optional[Dict[str, Any]] = None,
     strict_synthesis: bool = False,
 ) -> Tuple[str, str]:
-    synthesis_rule = "- Do not copy one evidence quote as the whole answer; synthesize the relevant evidence into a complete Korean sentence." if strict_synthesis else "- You may reuse exact terms from evidence, but write the final answer as a natural Korean answer."
-    system_prompt = f"""
-You are the final answer writer for a local PDF-only RAG system.
-Use only the provided evidence.
-Your job is NOT to select one quote. Your job is to compose the final answer from all relevant evidence.
-{synthesis_rule}
-- If the question has multiple requirements, cover every requirement supported by the evidence.
-- If the question asks for all paths, methods, cases, categories, services, or items, include every relevant distinct item found in the evidence.
-- If the evidence contains headings or bullet labels, preserve those distinctions when useful.
-- Do not add facts that are not supported by the evidence.
-- Keep the final answer concise but complete.
-- Return only JSON.
+    system_prompt = """
+당신은 PDF 근거 기반 질의응답 시스템의 최종 답변 작성자입니다.
+제공된 근거만 사용해 질문에 직접 답하십시오.
+
+작성 규칙:
+1. 근거 문장을 그대로 이어 붙이지 말고, 질문의 문법에 맞는 자연스러운 한국어 문장으로 재구성합니다.
+2. 절차형 원문이 '설치된 앱 실행 후 메뉴 선택'이라고 되어 있더라도, 질문이 설치할 앱을 묻는다면 'OO 앱을 설치한 뒤, 앱에서 XX 메뉴를 선택합니다'처럼 답합니다.
+3. 질문이 요구하는 정보만 답하고, 같은 단어가 등장하더라도 다른 업무·절차·조회 목적의 근거는 제외합니다.
+4. supports_requirements가 지정된 근거를 우선 사용하고, R1·R2 등 모든 요구사항을 각각 답변에 반영합니다.
+5. '모두', '전부', '가능한 대안', '경로'를 묻는 질문은 선택된 근거 안에 명시된 서로 다른 대안·경로·제한을 빠짐없이 나열합니다.
+6. 질문과 다른 FAQ 제목·다른 업무 목적의 내용은 절대 답변에 포함하지 않습니다. 예를 들어 부호 조회 질문에 통관이력 조회, 정보 변경, 재발급 절차를 섞지 않습니다.
+7. used_evidence_ids에는 최종 답변의 모든 핵심 문장을 직접 뒷받침하는 근거 ID를 모두 기록합니다. 근거 하나가 답변 전체를 뒷받침하지 않으면 필요한 ID를 추가합니다.
+8. 답변은 간결하되 완전해야 하며, 출처 문구·번호·화살표를 그대로 복사한 발췌문 형태로 작성하지 않습니다.
+9. 근거에 없는 사실은 추론하거나 추가하지 않습니다.
+10. 반드시 JSON 객체 하나만 반환합니다.
 """.strip()
     user_prompt = f"""
-[Question]
+[질문]
 {question}
 
-[Question plan]
+[질문 요구사항]
 {format_question_plan_for_prompt(question_plan)}
 
-[Evidence]
+[근거]
 {format_composer_evidence(evidence_items)}
 
-[Output JSON schema]
+[출력 JSON]
 {{
-  "final_answer": "Korean answer grounded only in the evidence; not a raw quote unless the evidence itself is already the full answer",
+  "final_answer": "질문에 직접 답하는 자연스러운 한국어 문장",
   "used_evidence_ids": ["G1"],
   "covered_requirements": {{"R1": true}},
   "missing_requirements": [],
@@ -3194,17 +3540,65 @@ def fit_composer_evidence_to_budget(
     llm,
     question: str,
     evidence_items: List[Dict[str, Any]],
-    token_budget: int,
-    min_items: int = 4,
+    n_ctx: int,
+    max_tokens: int,
+    safety_margin: int = 384,
+    min_items: int = 2,
     question_plan: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """실제 chat template token 수를 기준으로 context에 들어갈 evidence를 선택한다."""
     current = list(evidence_items)
-    while len(current) >= min_items:
-        system_prompt, user_prompt = build_grounded_answer_prompt(question, current, question_plan=question_plan)
-        if count_llama_tokens(llm, system_prompt + "\n\n" + user_prompt) <= token_budget:
-            return current
-        current = current[:-1]
-    return current if current else evidence_items[:1]
+    prompt_limit = max(512, int(n_ctx) - int(max_tokens) - int(safety_margin))
+    history = []
+
+    def prompt_tokens(items: List[Dict[str, Any]]) -> int:
+        system_prompt, user_prompt = build_grounded_answer_prompt(
+            question, items, question_plan=question_plan, strict_synthesis=True
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if hasattr(llm, "count_chat_tokens"):
+            return int(llm.count_chat_tokens(messages))
+        return count_llama_tokens(llm, system_prompt + "\n\n" + user_prompt) + 32
+
+    while current:
+        count = prompt_tokens(current)
+        history.append({"evidence_count": len(current), "prompt_tokens": count})
+        if count <= prompt_limit:
+            return current, {
+                "reason": "fit_ok",
+                "prompt_tokens": count,
+                "prompt_limit": prompt_limit,
+                "history": history,
+            }
+
+        if len(current) > min_items:
+            current = current[:-1]
+            continue
+
+        # 최소 evidence 수도 너무 길면 각 evidence를 균등하게 압축
+        overflow_ratio = max(0.25, min(0.85, prompt_limit / max(count, 1) * 0.88))
+        changed = False
+        shortened = []
+        for ev in current:
+            ev2 = dict(ev)
+            text = str(ev2.get("text", ""))
+            target_chars = max(240, int(len(text) * overflow_ratio))
+            if len(text) > target_chars:
+                ev2["text"] = text[:target_chars].rstrip() + "…"
+                changed = True
+            shortened.append(ev2)
+        if not changed:
+            break
+        current = shortened
+
+    return current[:1], {
+        "reason": "fit_minimal",
+        "prompt_limit": prompt_limit,
+        "history": history,
+    }
 
 
 def compose_grounded_answer_with_llm(
@@ -3234,16 +3628,30 @@ def compose_grounded_answer_with_llm(
         answer_obj["additional_explanation"] = "근거 생성용 evidence가 없어 추출형 답변을 사용했습니다."
         return answer_obj, {"enabled": True, "reason": "no_evidence_items"}
 
-    requested_budget = getattr(args, "composer_token_budget", getattr(args, "context_token_budget", 6200))
-    n_ctx = getattr(args, "n_ctx", 4096)
-    max_tokens = getattr(args, "composer_max_tokens", 700)
-    safe_budget = max(1200, min(int(requested_budget), int(n_ctx) - int(max_tokens) - 500))
+    evidence_items, requirement_evidence_map = build_requirement_evidence_map(
+        question=question,
+        question_plan=question_plan,
+        evidence_items=evidence_items,
+        top_per_requirement=3,
+        max_total=min(int(getattr(args, "max_composer_evidence", 12)), 10),
+    )
+    if not evidence_items:
+        answer_obj = dict(answer_obj)
+        answer_obj["additional_explanation"] = "요구사항에 대응하는 근거를 선택하지 못해 추출형 답변을 사용했습니다."
+        return answer_obj, {"enabled": True, "reason": "no_requirement_evidence"}
 
-    fitted = fit_composer_evidence_to_budget(
-        llm,
-        question,
-        evidence_items,
-        safe_budget,
+    requested_budget = getattr(args, "composer_token_budget", getattr(args, "context_token_budget", 6200))
+    n_ctx = int(getattr(args, "n_ctx", 8192))
+    max_tokens = int(getattr(args, "composer_max_tokens", 320))
+    safety_margin = int(getattr(args, "composer_safety_margin", 384))
+
+    fitted, fitting_diagnostics = fit_composer_evidence_to_budget(
+        llm=llm,
+        question=question,
+        evidence_items=evidence_items,
+        n_ctx=n_ctx,
+        max_tokens=max_tokens,
+        safety_margin=safety_margin,
         question_plan=question_plan,
     )
     if not fitted:
@@ -3254,55 +3662,37 @@ def compose_grounded_answer_with_llm(
     obj: Optional[Dict[str, Any]] = None
     used_evidence_items = fitted
 
+    # 기본 경로는 strict synthesis 1회 호출하나,
+    # 빈 결과나 실행 오류일 때만 더 작은 evidence로 한 번 재시도
+    max_attempts = max(1, int(getattr(args, "composer_max_attempts", 2)))
     candidate_sets = [fitted]
-    if len(fitted) > 6:
+    if max_attempts > 1 and len(fitted) > 4:
         candidate_sets.append(fitted[: max(4, len(fitted) // 2)])
-    if len(fitted) > 3:
-        candidate_sets.append(fitted[:3])
 
-    for pass_idx, candidate_evidence in enumerate(candidate_sets, start=1):
-        for strict in ([False, True] if pass_idx == 1 else [True]):
-            try:
-                obj = call_grounded_composer(
-                    llm=llm,
-                    question=question,
-                    evidence_items=candidate_evidence,
-                    question_plan=question_plan,
-                    max_tokens=max_tokens,
-                    strict_synthesis=strict,
-                )
-                final = normalize_space(obj.get("final_answer", ""))
-                attempts.append({
-                    "pass": pass_idx,
-                    "strict_synthesis": strict,
-                    "evidence_count": len(candidate_evidence),
-                    "ok": bool(final),
-                    "plain_fallback_used": bool(obj.get("plain_fallback_used")),
-                })
-                if final and not generated_answer_is_too_extractive(
-                    final,
-                    answer_obj.get("final_answer", ""),
-                    candidate_evidence,
-                    question_plan=question_plan,
-                ):
-                    used_evidence_items = candidate_evidence
-                    break
-                if final and not is_comprehensive_plan(question_plan):
-                    used_evidence_items = candidate_evidence
-                    break
-                obj = obj if final else None
-            except Exception as e:
-                last_error = e
-                attempts.append({
-                    "pass": pass_idx,
-                    "strict_synthesis": strict,
-                    "evidence_count": len(candidate_evidence),
-                    "ok": False,
-                    "error": str(e)[:500],
-                })
-                continue
-        if obj is not None and normalize_space(obj.get("final_answer", "")):
-            break
+    for pass_idx, candidate_evidence in enumerate(candidate_sets[:max_attempts], start=1):
+        try:
+            obj = call_grounded_composer(
+                llm=llm, question=question, evidence_items=candidate_evidence,
+                question_plan=question_plan, max_tokens=max_tokens, strict_synthesis=True,
+            )
+            final = normalize_space(obj.get("final_answer", ""))
+            attempts.append({
+                "pass": pass_idx, "strict_synthesis": True,
+                "evidence_count": len(candidate_evidence), "ok": bool(final),
+                "plain_fallback_used": bool(obj.get("plain_fallback_used")),
+            })
+            if final:
+                used_evidence_items = candidate_evidence
+                break
+            obj = None
+        except Exception as e:
+            last_error = e
+            obj = None
+            attempts.append({
+                "pass": pass_idx, "strict_synthesis": True,
+                "evidence_count": len(candidate_evidence), "ok": False,
+                "error": str(e)[:500],
+            })
 
     if obj is None or not normalize_space(obj.get("final_answer", "")):
         fallback = dict(answer_obj)
@@ -3348,9 +3738,11 @@ def compose_grounded_answer_with_llm(
         "used_evidence_ids": used_ids,
         "evidence_count": len(used_evidence_items),
         "total_evidence_candidates": len(evidence_items),
-        "safe_token_budget": safe_budget,
+        "safe_token_budget": fitting_diagnostics.get("prompt_limit"),
+        "fitting_diagnostics": fitting_diagnostics,
         "attempts": attempts,
         "question_plan": question_plan,
+        "requirement_evidence_map": requirement_evidence_map,
         "raw": obj,
     }
     return generated, generated["render_diagnostics"]["grounded_generation"]
@@ -3362,13 +3754,23 @@ def answer_question(
     index,
     args,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
-    question_plan = plan_question_with_llm(
-        llm=llm,
-        question=question,
-        max_queries=getattr(args, "num_retrieval_queries", 1),
-        max_requirements=getattr(args, "max_question_requirements", 6),
-    )
+    stage_t0 = time.perf_counter()
+    planner_mode = getattr(args, "query_planner", "heuristic")
+    if planner_mode == "llm":
+        question_plan = plan_question_with_llm(
+            llm=llm, question=question,
+            max_queries=getattr(args, "num_retrieval_queries", 1),
+            max_requirements=getattr(args, "max_question_requirements", 6),
+        )
+    else:
+        question_plan = plan_question_heuristically(
+            question=question,
+            max_queries=getattr(args, "num_retrieval_queries", 1),
+            max_requirements=getattr(args, "max_question_requirements", 6),
+        )
+    planner_sec = time.perf_counter() - stage_t0
     retrieval_queries = question_plan.get("retrieval_queries", [question]) or [question]
+    stage_t0 = time.perf_counter()
     context_items, retrieval_diagnostics = retrieve_context_items_for_queries(
         question=question,
         retrieval_queries=retrieval_queries,
@@ -3376,9 +3778,13 @@ def answer_question(
         index=index,
         args=args,
     )
+    retrieval_sec = time.perf_counter() - stage_t0
     raw_context_count = len(context_items)
+    stage_t0 = time.perf_counter()
     candidate_units = build_candidate_units(question, context_items, args.max_units_per_chunk, args.max_chars_per_answer_unit)
     ranked_units = rerank_answer_units(question, candidate_units, args.unit_cross_top_n, args.max_answer_units, enabled=not args.no_reranker)
+    unit_rerank_sec = time.perf_counter() - stage_t0
+    generation_t0 = time.perf_counter()
 
     if getattr(args, "answer_mode", "grounded") == "grounded":
         selection_obj = {
@@ -3405,6 +3811,7 @@ def answer_question(
         extractive_answer_obj = dict(answer_obj)
         answer_obj, coverage_diagnostics = repair_answer_if_needed(question, answer_obj, ranked_units)
         generation_diagnostics = {"enabled": False, "reason": "extractive_mode"}
+    generation_sec = time.perf_counter() - generation_t0
     generated_coverage = evaluate_answer_coverage(question, answer_obj)
     diagnostics = {
         "question_plan": question_plan,
@@ -3422,6 +3829,13 @@ def answer_question(
         "candidate_unit_count": len(candidate_units),
         "llm_unit_count": len(llm_units),
         "question_intent": infer_question_intent(question),
+        "stage_timing_sec": {
+            "query_planning": round(planner_sec, 4),
+            "retrieval_and_chunk_rerank": round(retrieval_sec, 4),
+            "answer_unit_rerank": round(unit_rerank_sec, 4),
+            "answer_generation": round(generation_sec, 4),
+            "total": round(planner_sec + retrieval_sec + unit_rerank_sec + generation_sec, 4),
+        },
     }
     return answer_obj, context_items, diagnostics
 
@@ -3725,27 +4139,31 @@ def main() -> None:
     parser.add_argument("--llm_model", type=str, default=DEFAULT_LLM_MODEL, choices=list(LLM_PROFILES.keys()) + ["all"])
     parser.add_argument("--answer_mode", type=str, default="grounded", choices=["extractive", "grounded"])
 
-    parser.add_argument("--dense_k", type=int, default=80)
-    parser.add_argument("--bm25_k", type=int, default=80)
+    parser.add_argument("--dense_k", type=int, default=60)
+    parser.add_argument("--bm25_k", type=int, default=60)
     parser.add_argument("--rrf_k", type=int, default=60)
-    parser.add_argument("--candidate_k", type=int, default=50)
-    parser.add_argument("--top_k", type=int, default=16)
+    parser.add_argument("--candidate_k", type=int, default=40)
+    parser.add_argument("--top_k", type=int, default=14)
     parser.add_argument("--expand_window", type=int, default=2)
-    parser.add_argument("--max_context_chunks", type=int, default=28)
+    parser.add_argument("--max_context_chunks", type=int, default=24)
     parser.add_argument("--context_token_budget", type=int, default=6200)
     parser.add_argument("--max_llm_context_items", type=int, default=14)
     parser.add_argument("--max_chars_per_context_item", type=int, default=1200)
     parser.add_argument("--max_units_per_chunk", type=int, default=16)
     parser.add_argument("--max_chars_per_answer_unit", type=int, default=1500)
-    parser.add_argument("--unit_cross_top_n", type=int, default=60)
-    parser.add_argument("--max_answer_units", type=int, default=24)
-    parser.add_argument("--num_retrieval_queries", type=int, default=4)
+    parser.add_argument("--unit_cross_top_n", type=int, default=28)
+    parser.add_argument("--max_answer_units", type=int, default=18)
+    parser.add_argument("--num_retrieval_queries", type=int, default=3)
     parser.add_argument("--max_question_requirements", type=int, default=6)
-    parser.add_argument("--composer_token_budget", type=int, default=3200)
-    parser.add_argument("--composer_max_tokens", type=int, default=650)
-    parser.add_argument("--max_composer_evidence", type=int, default=20)
-    parser.add_argument("--max_composer_sections", type=int, default=4)
-    parser.add_argument("--max_chars_per_composer_evidence", type=int, default=2200)
+    parser.add_argument("--query_planner", type=str, default="heuristic", choices=["heuristic", "llm"])
+    parser.add_argument("--rerank_pool_k", type=int, default=40)
+    parser.add_argument("--composer_token_budget", type=int, default=2600)
+    parser.add_argument("--composer_max_tokens", type=int, default=320)
+    parser.add_argument("--max_composer_evidence", type=int, default=12)
+    parser.add_argument("--max_composer_sections", type=int, default=3)
+    parser.add_argument("--max_chars_per_composer_evidence", type=int, default=1400)
+    parser.add_argument("--composer_max_attempts", type=int, default=2)
+    parser.add_argument("--composer_safety_margin", type=int, default=384)
 
     parser.add_argument("--reranker_mode", type=str, default="on", choices=["on", "off", "all"])
     parser.add_argument("--no_reranker", action="store_true")
@@ -3754,7 +4172,7 @@ def main() -> None:
     parser.add_argument("--llm_timeout", type=int, default=240)
     parser.add_argument("--llm_n_batch", type=int, default=128)
     parser.add_argument("--llm_n_ubatch", type=int, default=128)
-    parser.add_argument("--n_ctx", type=int, default=4096)
+    parser.add_argument("--n_ctx", type=int, default=8192)
     parser.add_argument("--n_gpu_layers", type=int, default=0)
 
     args = parser.parse_args()
